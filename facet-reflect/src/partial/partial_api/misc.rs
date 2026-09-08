@@ -921,7 +921,7 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
 
     fn complete_smart_pointer_frame(smart_ptr_frame: &mut Frame, inner_frame: Frame) {
         if let Def::Pointer(smart_ptr_def) = smart_ptr_frame.allocated.shape().def {
-            // Use the SmartPointer vtable to create the smart pointer from the inner value
+            // Use the SmartPointer vtable to finalize the smart pointer from the inner value.
             if let Some(new_into_fn) = smart_ptr_def.vtable.new_into_fn {
                 // Sized pointee case: use new_into_fn
                 let _ = unsafe { inner_frame.data.assume_init() };
@@ -950,12 +950,30 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
                     pending_inner: None,
                 };
                 smart_ptr_frame.is_init = true;
+            } else if Frame::try_borrow_and_promote_smart_pointer(
+                smart_ptr_def,
+                smart_ptr_frame.data,
+                inner_frame.allocated.shape(),
+                inner_frame.data,
+            ) {
+                // Promotion has initialized the independent destination. Record that
+                // before dropping the source, whose destructor may run user code.
+                smart_ptr_frame.tracker = Tracker::SmartPointer {
+                    building_inner: false,
+                    pending_inner: None,
+                };
+                smart_ptr_frame.is_init = true;
+
+                // The source was validated as fully initialized before this call.
+                // Drop the whole value, including an enum's custom destructor, rather
+                // than using partial-initialization cleanup for its individual fields.
+                PendingSmartPointerInner::from_initialized_frame(inner_frame).drop_and_dealloc();
             } else if let Some(pointee) = smart_ptr_def.pointee()
                 && pointee.is_shape(str::SHAPE)
                 && inner_frame.allocated.shape().is_shape(String::SHAPE)
             {
                 // Unsized pointee case: String -> Arc<str>/Box<str>/Rc<str> conversion
-                use ::alloc::{rc::Rc, string::String, sync::Arc};
+                use ::alloc::{borrow::Cow, rc::Rc, string::String, sync::Arc};
                 use facet_core::KnownPointer;
 
                 let Some(known) = smart_ptr_def.known else {
@@ -993,6 +1011,15 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
                             core::ptr::write(
                                 smart_ptr_frame.data.as_mut_byte_ptr() as *mut Rc<str>,
                                 rc,
+                            );
+                        }
+                    }
+                    KnownPointer::Cow => {
+                        let cow: Cow<'static, str> = Cow::Owned(string_value);
+                        unsafe {
+                            core::ptr::write(
+                                smart_ptr_frame.data.as_mut_byte_ptr() as *mut Cow<'static, str>,
+                                cow,
                             );
                         }
                     }
@@ -2234,15 +2261,32 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
                 // We just popped the inner value frame for a SmartPointer
                 if *building_inner {
                     if matches!(parent_frame.allocated.shape().def, Def::Pointer(_)) {
-                        // Check if we're in deferred mode - if so, store the inner value pointer
+                        // Check if we're in deferred mode - if so, retain the
+                        // fully initialized inner staging allocation.
                         if is_deferred_mode {
-                            // Store the inner value pointer for deferred new_into_fn.
-                            // popped_frame isn't stored — it's silently dropped after this
-                            // block (Frame has no Drop impl), so pending_inner is the sole
-                            // owner of this buffer.
-                            *pending_inner = Some(popped_frame.data);
+                            if let Err(e) = popped_frame.fill_defaults() {
+                                popped_frame.deinit();
+                                popped_frame.dealloc();
+                                return Err(self.err(e));
+                            }
+                            if let Err(e) = popped_frame.require_full_initialization() {
+                                popped_frame.deinit();
+                                popped_frame.dealloc();
+                                return Err(self.err(e));
+                            }
+
+                            // `popped_frame` is not stored for re-entry. Transfer
+                            // its exact staging metadata to the pending slot so
+                            // finalization and cancellation use the right shape
+                            // (for example, `String` rather than `str`).
+                            *pending_inner = Some(
+                                PendingSmartPointerInner::from_initialized_frame(popped_frame),
+                            );
                             *building_inner = false;
-                            parent_frame.is_init = true;
+                            // The parent pointer itself remains uninitialized
+                            // until deferred finalization consumes this staging
+                            // value.
+                            parent_frame.is_init = false;
                             crate::trace!(
                                 "end() SMARTPTR: stored pending_inner, will finalize in finish_deferred"
                             );
@@ -2256,7 +2300,7 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
                                 }
 
                                 // Use complete_smart_pointer_frame which handles both:
-                                // - Sized pointees (via new_into_fn)
+                                // - Sized pointees (via owned transfer or borrow/promote)
                                 // - Unsized pointees like str (via String conversion)
                                 Self::complete_smart_pointer_frame(parent_frame, popped_frame);
                                 crate::trace!(

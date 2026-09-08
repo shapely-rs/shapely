@@ -1,7 +1,15 @@
-use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    mem::MaybeUninit,
+    ptr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use facet::Facet;
-use facet_reflect::Partial;
+use facet::{Facet, KnownPointer, PtrMut, PtrUninit, Type, UserType};
+use facet_reflect::{Partial, Peek};
 use facet_testhelpers::{IPanic, test};
 
 #[derive(Debug, PartialEq, Facet)]
@@ -17,6 +25,368 @@ struct OuterYesArc {
 #[derive(Debug, PartialEq, Facet)]
 struct OuterNoArc {
     inner: Inner,
+}
+
+static COW_DROP_TRACKER_DROPS: AtomicUsize = AtomicUsize::new(0);
+static COW_DROP_TRACKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+static COW_ENUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+struct CowDropTracker {
+    value: u8,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+#[repr(u8)]
+enum CowDropTrackerEnum {
+    Unit,
+    Payload {
+        value: CowDropTracker,
+    },
+    Pair {
+        first: CowDropTracker,
+        second: CowDropTracker,
+    },
+}
+
+impl Drop for CowDropTrackerEnum {
+    fn drop(&mut self) {
+        COW_ENUM_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// A deliberately small model of Cloud Terrastodon's Object Explorer. The
+// selected value is type-erased, while the request field is found from the
+// request shape rather than referenced directly by the construction code.
+#[derive(Clone, Debug, PartialEq, Facet)]
+#[repr(C)]
+struct OrganizationUrl {
+    value: String,
+}
+
+#[derive(Debug, Facet)]
+#[repr(C)]
+struct ListProjectsRequest {
+    organization_url: Cow<'static, OrganizationUrl>,
+}
+
+impl Drop for CowDropTracker {
+    fn drop(&mut self) {
+        COW_DROP_TRACKER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn cow_object_explorer_can_borrow_then_materialize_a_selected_field() {
+    let selected_value = OrganizationUrl {
+        value: "https://dev.azure.com/example".to_owned(),
+    };
+    let selected = Peek::new(&selected_value);
+
+    let Type::User(UserType::Struct(request_def)) = ListProjectsRequest::SHAPE.ty else {
+        panic!("ListProjectsRequest should have reflected struct metadata");
+    };
+    let organization_url_field = request_def
+        .fields
+        .iter()
+        .find(|field| field.name == "organization_url")
+        .expect("Object Explorer should find the selected request field");
+    let organization_url_shape = organization_url_field.shape();
+    let organization_url_pointer = organization_url_shape
+        .def
+        .into_pointer()
+        .expect("organization_url should be reflected as a pointer");
+
+    assert_eq!(
+        organization_url_pointer
+            .pointee()
+            .expect("Cow should expose its pointee shape")
+            .id,
+        selected.shape().id,
+        "the dynamically selected value must match the Cow field's pointee type"
+    );
+    assert_eq!(organization_url_pointer.known, Some(KnownPointer::Cow));
+
+    let borrow_from_pointee = organization_url_pointer
+        .vtable
+        .borrow_from_pointee_fn
+        .expect("Cow should expose reflected borrowed construction");
+    let promote_to_owned = organization_url_pointer
+        .vtable
+        .promote_to_owned_fn
+        .expect("Cow should expose reflected in-place ownership promotion");
+
+    // The request has one field in this miniature model, so initializing the
+    // reflected field initializes the complete request.
+    let mut request = MaybeUninit::<ListProjectsRequest>::uninit();
+    let organization_url_slot = unsafe {
+        PtrUninit::from_maybe_uninit(&mut request).field_uninit(organization_url_field.offset)
+    };
+    unsafe { borrow_from_pointee(organization_url_slot, selected.data()) };
+    let mut request = unsafe { request.assume_init() };
+
+    assert!(matches!(
+        &request.organization_url,
+        Cow::Borrowed(value) if ptr::eq(*value, &selected_value),
+    ));
+
+    // Object Explorer may now release the selected source: promotion must
+    // remove the Cow's dependency on it before that happens. `Peek` is a Copy
+    // view, so only the source itself owns storage here.
+    unsafe { promote_to_owned(PtrMut::new(&mut request.organization_url)) };
+    drop(selected_value);
+
+    assert!(matches!(
+        &request.organization_url,
+        Cow::Owned(value) if value.value == "https://dev.azure.com/example",
+    ));
+}
+
+#[test]
+fn cow_partial_sized_borrow_promote_drops_source_once() -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+    COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+
+    let cow = Partial::alloc::<Cow<'static, CowDropTracker>>()?
+        .begin_smart_ptr()?
+        .set(CowDropTracker { value: 41 })?
+        .end()?
+        .build()?
+        .materialize::<Cow<'static, CowDropTracker>>()?;
+
+    assert!(matches!(&cow, Cow::Owned(value) if value.value == 41));
+    assert_eq!(
+        COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst),
+        1,
+        "the temporary pointee is dropped after Cow materializes its owned clone"
+    );
+
+    drop(cow);
+    assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+fn check_cow_enum_source_and_owned_clone_drop(deferred: bool) -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+
+    for variant in ["Unit", "Payload"] {
+        COW_ENUM_DROPS.store(0, Ordering::SeqCst);
+        COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+        let mut partial = Partial::alloc::<Cow<'static, CowDropTrackerEnum>>()?;
+        if deferred {
+            partial = partial.begin_deferred()?;
+        }
+        partial = partial.begin_smart_ptr()?.select_variant_named(variant)?;
+        if variant == "Payload" {
+            partial = partial
+                .begin_field("value")?
+                .set(CowDropTracker { value: 46 })?
+                .end()?;
+        }
+        partial = partial.end()?;
+        if deferred {
+            partial = partial.finish_deferred()?;
+        }
+        let cow = partial
+            .build()?
+            .materialize::<Cow<'static, CowDropTrackerEnum>>()?;
+
+        assert!(matches!(&cow, Cow::Owned(_)));
+        assert_eq!(COW_ENUM_DROPS.load(Ordering::SeqCst), 1);
+        let payload_drops = usize::from(variant == "Payload");
+        assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), payload_drops);
+
+        drop(cow);
+        assert_eq!(COW_ENUM_DROPS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst),
+            payload_drops * 2
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cow_partial_enum_borrow_promote_drops_source_and_owned_clone() -> Result<(), IPanic> {
+    check_cow_enum_source_and_owned_clone_drop(false)
+}
+
+#[test]
+fn cow_partial_enum_borrow_promote_deferred_drops_source_and_owned_clone() -> Result<(), IPanic> {
+    check_cow_enum_source_and_owned_clone_drop(true)
+}
+
+#[test]
+fn cow_partial_enum_cancellation_respects_initialized_fields() -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+
+    for deferred in [false, true] {
+        for store_inner in [false, true] {
+            if store_inner && !deferred {
+                continue; // Strict end() promotes instead of storing staging.
+            }
+            for variant in ["Unit", "Payload", "Pair"] {
+                COW_ENUM_DROPS.store(0, Ordering::SeqCst);
+                COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+                let mut partial = Partial::alloc::<Cow<'static, CowDropTrackerEnum>>()?;
+                if deferred {
+                    partial = partial.begin_deferred()?;
+                }
+                partial = partial.begin_smart_ptr()?.select_variant_named(variant)?;
+                if variant != "Unit" {
+                    let field = if variant == "Payload" {
+                        "value"
+                    } else {
+                        "first"
+                    };
+                    partial = partial
+                        .begin_field(field)?
+                        .set(CowDropTracker { value: 47 })?
+                        .end()?;
+                }
+                if store_inner {
+                    partial = partial.end()?;
+                }
+                drop(partial);
+
+                // Deferred field frames are canceled separately, leaving the enum
+                // incomplete. Only a unit variant or fully assembled strict payload
+                // can run its whole-value destructor. Pair never has both fields.
+                let enum_drops =
+                    usize::from(variant == "Unit" || (!deferred && variant == "Payload"));
+                assert_eq!(COW_ENUM_DROPS.load(Ordering::SeqCst), enum_drops);
+                assert_eq!(
+                    COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst),
+                    usize::from(variant != "Unit")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cow_str_begin_smart_ptr_materializes_owned() -> Result<(), IPanic> {
+    let cow = Partial::alloc::<Cow<'static, str>>()?
+        .begin_smart_ptr()?
+        .set(String::from("borrow then own"))?
+        .end()?
+        .build()?
+        .materialize::<Cow<'static, str>>()?;
+
+    assert!(matches!(&cow, Cow::Owned(value) if value == "borrow then own"));
+    Ok(())
+}
+
+#[test]
+fn cow_partial_sized_borrow_promote_deferred() -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+    COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+
+    let partial = Partial::alloc::<Cow<'static, CowDropTracker>>()?
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(CowDropTracker { value: 42 })?
+        .end()?
+        .finish_deferred()?;
+    let cow = partial
+        .build()?
+        .materialize::<Cow<'static, CowDropTracker>>()?;
+
+    assert!(matches!(&cow, Cow::Owned(value) if value.value == 42));
+    assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), 1);
+    drop(cow);
+    assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+fn cow_partial_sized_deferred_drop_without_finish_drops_staging_source() -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+    COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+
+    let partial = Partial::alloc::<Cow<'static, CowDropTracker>>()?
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(CowDropTracker { value: 43 })?
+        .end()?;
+    drop(partial);
+
+    assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+fn cow_external_deferred_reentry_drops_replaced_staging_source() -> Result<(), IPanic> {
+    let _lock = COW_DROP_TRACKER_TEST_LOCK.lock().unwrap();
+    COW_DROP_TRACKER_DROPS.store(0, Ordering::SeqCst);
+
+    let mut destination = MaybeUninit::<Cow<'static, CowDropTracker>>::uninit();
+    let destination = PtrUninit::new(destination.as_mut_ptr().cast::<u8>());
+
+    // Cloud Terrastodon uses caller-owned destinations for some dynamic object
+    // construction. Re-entering the same deferred pointer must clean the first
+    // staging value before the second one replaces it.
+    let partial: Partial<'_, false> =
+        unsafe { Partial::from_raw_with_shape(destination, Cow::<CowDropTracker>::SHAPE)? };
+    let partial = partial
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(CowDropTracker { value: 44 })?
+        .end()?
+        .begin_smart_ptr()?
+        .set(CowDropTracker { value: 45 })?
+        .end()?;
+    drop(partial);
+
+    assert_eq!(COW_DROP_TRACKER_DROPS.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+fn cow_str_deferred_drop_without_finish_releases_staging_string() -> Result<(), IPanic> {
+    let partial = Partial::alloc::<Cow<'static, str>>()?
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(String::from(
+            "the deferred String staging allocation must be released on cancellation",
+        ))?
+        .end()?;
+    drop(partial);
+
+    // Miri verifies that the non-empty String allocation was released.
+    Ok(())
+}
+
+#[test]
+fn cow_str_begin_smart_ptr_deferred_materializes_owned() -> Result<(), IPanic> {
+    let partial = Partial::alloc::<Cow<'static, str>>()?
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(String::from("deferred borrow then own"))?
+        .end()?
+        .finish_deferred()?;
+    let cow = partial.build()?.materialize::<Cow<'static, str>>()?;
+
+    assert!(matches!(&cow, Cow::Owned(value) if value == "deferred borrow then own"));
+    Ok(())
+}
+
+#[test]
+fn cow_str_deferred_reentry_restores_string_staging() -> Result<(), IPanic> {
+    let partial = Partial::alloc::<Cow<'static, str>>()?
+        .begin_deferred()?
+        .begin_smart_ptr()?
+        .set(String::from("first staged value"))?
+        .end()?
+        .begin_smart_ptr()?
+        .set(String::from("replacement staged value"))?
+        .end()?
+        .finish_deferred()?;
+    let cow = partial.build()?.materialize::<Cow<'static, str>>()?;
+
+    assert!(matches!(&cow, Cow::Owned(value) if value == "replacement staged value"));
+    Ok(())
 }
 
 #[test]

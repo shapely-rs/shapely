@@ -366,6 +366,7 @@ impl FrameOwnership {
 /// This ensures that the shape and allocated size are always in sync and cannot
 /// drift apart, preventing the class of bugs where a frame's shape doesn't match
 /// what was actually allocated (see issue #1568).
+#[derive(Debug)]
 pub(crate) struct AllocatedShape {
     shape: &'static Shape,
     allocated_size: usize,
@@ -385,6 +386,24 @@ impl AllocatedShape {
 
     pub(crate) const fn allocated_size(&self) -> usize {
         self.allocated_size
+    }
+
+    /// Deallocate a buffer allocated for this shape's exact recorded size.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be the still-valid allocation paired with this shape.
+    unsafe fn deallocate(&self, data: PtrUninit) {
+        if self.allocated_size() == 0 {
+            return;
+        }
+
+        if let Ok(layout) = self.shape.layout.sized_layout() {
+            let actual_layout =
+                core::alloc::Layout::from_size_align(self.allocated_size(), layout.align())
+                    .expect("allocated_size must be valid");
+            unsafe { alloc::alloc::dealloc(data.as_mut_byte_ptr(), actual_layout) };
+        }
     }
 }
 
@@ -428,6 +447,18 @@ pub(crate) struct Frame {
     pub(crate) type_plan: typeplan::NodeId,
 }
 
+/// A fully initialized smart-pointer staging allocation held until a deferred
+/// parent frame can consume it.
+///
+/// The staging shape is intentionally retained separately from the pointer
+/// pointee. For example, `Cow<str>` stages a sized `String`, not a wide `str`.
+#[derive(Debug)]
+pub(crate) struct PendingSmartPointerInner {
+    data: PtrUninit,
+    allocated: AllocatedShape,
+    ownership: FrameOwnership,
+}
+
 #[derive(Debug)]
 pub(crate) enum Tracker {
     /// Simple scalar value - no partial initialization tracking needed.
@@ -456,11 +487,12 @@ pub(crate) enum Tracker {
     SmartPointer {
         /// Whether we're currently building the inner value
         building_inner: bool,
-        /// Pending inner value pointer to be moved with new_into_fn on finalization.
+        /// Pending inner value allocation to be finalized into the smart pointer.
         /// Deferred processing requires keeping the inner value's memory stable,
-        /// so we delay the new_into_fn() call until the SmartPointer frame is finalized.
-        /// None = no pending inner, Some = inner value ready to be moved into SmartPointer.
-        pending_inner: Option<PtrUninit>,
+        /// including its actual staging shape, allocation size, and cleanup
+        /// authority, until the SmartPointer frame is finalized.
+        /// None = no pending inner, Some = inner value ready for finalization.
+        pending_inner: Option<PendingSmartPointerInner>,
     },
 
     /// We're initializing an `Arc<[T]>`, `Box<[T]>`, `Rc<[T]>`, etc.
@@ -645,6 +677,47 @@ impl Tracker {
     }
 }
 
+impl PendingSmartPointerInner {
+    /// Transfers a fully initialized child frame into deferred smart-pointer
+    /// staging. Callers must validate the frame before erasing its tracker.
+    fn from_initialized_frame(frame: Frame) -> Self {
+        Self {
+            data: frame.data,
+            allocated: frame.allocated,
+            ownership: frame.ownership,
+        }
+    }
+
+    #[inline]
+    fn shape(&self) -> &'static Shape {
+        self.allocated.shape()
+    }
+
+    #[inline]
+    fn data(&self) -> PtrUninit {
+        self.data
+    }
+
+    /// Dispose of a staging value which remains initialized.
+    fn drop_and_dealloc(self) {
+        if !matches!(self.ownership, FrameOwnership::BorrowedInPlace) {
+            unsafe {
+                self.allocated
+                    .shape()
+                    .call_drop_in_place(self.data.assume_init());
+            }
+        }
+        self.dealloc_after_move();
+    }
+
+    /// Dispose only of the allocation after ownership of its value was moved.
+    fn dealloc_after_move(self) {
+        if self.ownership.needs_dealloc() {
+            unsafe { self.allocated.deallocate(self.data) };
+        }
+    }
+}
+
 impl Frame {
     fn new(
         data: PtrUninit,
@@ -671,6 +744,42 @@ impl Frame {
         }
     }
 
+    /// Releases deferred smart-pointer staging without touching the pointer storage.
+    ///
+    /// A pending staging value owns its own allocation even when this frame borrows
+    /// its destination storage (for example, an External root supplied by a caller).
+    /// It therefore must be drained independently of the frame's ownership policy.
+    /// Returns whether staging was present.
+    fn drop_pending_smart_pointer_staging(&mut self) -> bool {
+        let Tracker::SmartPointer { pending_inner, .. } = &mut self.tracker else {
+            return false;
+        };
+
+        let Some(pending_inner) = pending_inner.take() else {
+            return false;
+        };
+
+        pending_inner.drop_and_dealloc();
+        true
+    }
+
+    /// Deinitialize a canceled frame after its child frames have been cleaned up
+    /// and their bits cleared in this frame's tracker.
+    ///
+    /// At this point, an enum with all its field bits set is a complete value,
+    /// so its custom destructor must run too. This cannot be inferred at every
+    /// deinit call site: deferred parent bits may precede child validation.
+    fn deinit_for_cancellation(&mut self) {
+        if matches!(
+            &self.tracker,
+            Tracker::Enum { variant, data, .. } if data.all_set(variant.data.fields.len())
+        ) {
+            self.tracker = Tracker::Scalar;
+            self.is_init = true;
+        }
+        self.deinit();
+    }
+
     /// Deinitialize any initialized field: calls `drop_in_place` but does not free any
     /// memory even if the frame owns that memory.
     ///
@@ -680,6 +789,7 @@ impl Frame {
         // collection entries (Value objects, Option inners) where the parent has no
         // per-entry tracking. Dropping here would cause double-free when parent drops.
         if matches!(self.ownership, FrameOwnership::BorrowedInPlace) {
+            self.drop_pending_smart_pointer_staging();
             self.is_init = false;
             self.tracker = Tracker::Scalar;
             return;
@@ -760,17 +870,16 @@ impl Frame {
                 }
             }
             Tracker::SmartPointer { pending_inner, .. } => {
-                // If there's a pending inner value, drop it
-                if let Some(inner_ptr) = pending_inner
-                    && let Def::Pointer(ptr_def) = self.allocated.shape().def
-                    && let Some(inner_shape) = ptr_def.pointee
-                {
-                    unsafe {
-                        inner_shape.call_drop_in_place(PtrMut::new(inner_ptr.as_mut_byte_ptr()))
-                    };
+                // A pending staging allocation is the sole owner of its
+                // cleanup. The pointer storage itself remains uninitialized
+                // until finalization succeeds.
+                let had_pending = pending_inner.is_some();
+                if let Some(pending_inner) = pending_inner.take() {
+                    pending_inner.drop_and_dealloc();
                 }
-                // Drop the initialized SmartPointer
-                if self.is_init {
+                // Drop an actual initialized SmartPointer, but never attempt
+                // to drop its uninitialized storage while staging is pending.
+                if self.is_init && !had_pending {
                     unsafe {
                         self.allocated
                             .shape()
@@ -1066,18 +1175,7 @@ impl Frame {
             unreachable!("a frame has to be deinitialized before being deallocated")
         }
 
-        // Deallocate using the actual allocated size (not derived from shape)
-        if self.allocated.allocated_size() > 0 {
-            // Use the shape for alignment, but the stored size for the actual allocation
-            if let Ok(layout) = self.allocated.shape().layout.sized_layout() {
-                let actual_layout = core::alloc::Layout::from_size_align(
-                    self.allocated.allocated_size(),
-                    layout.align(),
-                )
-                .expect("allocated_size must be valid");
-                unsafe { alloc::alloc::dealloc(self.data.as_mut_byte_ptr(), actual_layout) };
-            }
-        }
+        unsafe { self.allocated.deallocate(self.data) };
     }
 
     /// Fill in defaults for any unset fields that have default values.
@@ -1425,55 +1523,109 @@ impl Frame {
         Ok(())
     }
 
+    /// Construct an independent pointer through its explicit borrow-and-promote
+    /// capabilities.
+    ///
+    /// This is deliberately limited to matching, sized pointees. In particular,
+    /// the `str` builder stores a `String` in the temporary buffer, so it must use
+    /// its dedicated conversion below rather than pass a thin `String` pointer to
+    /// a hook expecting a wide `str` pointer.
+    ///
+    /// Returns `true` when both hooks were present and the destination was
+    /// initialized. The caller still owns and must dispose of `inner_data`.
+    fn try_borrow_and_promote_smart_pointer(
+        smart_ptr_def: facet_core::PointerDef,
+        smart_ptr_data: PtrUninit,
+        inner_shape: &'static Shape,
+        inner_data: PtrUninit,
+    ) -> bool {
+        let (Some(borrow_from_pointee_fn), Some(promote_to_owned_fn), Some(pointee_shape)) = (
+            smart_ptr_def.vtable.borrow_from_pointee_fn,
+            smart_ptr_def.vtable.promote_to_owned_fn,
+            smart_ptr_def.pointee,
+        ) else {
+            return false;
+        };
+
+        if !pointee_shape.is_shape(inner_shape) || pointee_shape.layout.sized_layout().is_err() {
+            return false;
+        }
+
+        // SAFETY: callers pass initialized storage for the matching, sized pointee.
+        let inner_data = unsafe { inner_data.assume_init() };
+        // SAFETY: the paired hooks' contracts make the destination initialized and
+        // independent before this function returns. The source remains initialized,
+        // so the caller must still drop it.
+        unsafe {
+            borrow_from_pointee_fn(smart_ptr_data, inner_data.as_const());
+            promote_to_owned_fn(smart_ptr_data.assume_init());
+        }
+        true
+    }
+
     fn complete_pending_smart_pointer(
         smart_ptr_shape: &'static Shape,
         smart_ptr_def: facet_core::PointerDef,
         smart_ptr_data: PtrUninit,
-        inner_ptr: PtrUninit,
+        pending_inner: PendingSmartPointerInner,
     ) -> Result<(), ReflectErrorKind> {
-        // Check for sized pointee case first (uses new_into_fn)
-        if let Some(new_into_fn) = smart_ptr_def.vtable.new_into_fn {
-            let Some(inner_shape) = smart_ptr_def.pointee else {
-                return Err(ReflectErrorKind::OperationFailed {
-                    shape: smart_ptr_shape,
-                    operation: "SmartPointer missing pointee shape",
-                });
-            };
+        let inner_shape = pending_inner.shape();
+        let inner_data = pending_inner.data();
 
-            // The inner_ptr contains the initialized inner value
-            let _ = unsafe { inner_ptr.assume_init() };
+        // Check the owned-transfer construction path first. It can only consume
+        // a staging allocation whose actual shape matches the reflected pointee.
+        if let (Some(new_into_fn), Some(pointee_shape)) =
+            (smart_ptr_def.vtable.new_into_fn, smart_ptr_def.pointee)
+            && pointee_shape.is_shape(inner_shape)
+        {
+            unsafe { new_into_fn(smart_ptr_data, inner_data.assume_init()) };
+            pending_inner.dealloc_after_move();
+            return Ok(());
+        }
 
-            // Initialize the SmartPointer with the inner value
-            unsafe {
-                new_into_fn(smart_ptr_data, PtrMut::new(inner_ptr.as_mut_byte_ptr()));
-            }
-
-            // Deallocate the inner value's memory since new_into_fn moved it
-            if let Ok(layout) = inner_shape.layout.sized_layout()
-                && layout.size() > 0
-            {
-                unsafe { alloc::alloc::dealloc(inner_ptr.as_mut_byte_ptr(), layout) };
-            }
-
+        // Some pointer types (currently `Cow`) first borrow a matching pointee and
+        // then materialize themselves before the source is released. Unlike
+        // `new_into_fn`, borrowing does not consume the source, so drop it before
+        // releasing the temporary allocation.
+        if Self::try_borrow_and_promote_smart_pointer(
+            smart_ptr_def,
+            smart_ptr_data,
+            inner_shape,
+            inner_data,
+        ) {
+            pending_inner.drop_and_dealloc();
             return Ok(());
         }
 
         // Check for unsized pointee case: String -> Arc<str>/Box<str>/Rc<str>
         if let Some(pointee) = smart_ptr_def.pointee()
             && pointee.is_shape(str::SHAPE)
+            && inner_shape.is_shape(alloc::string::String::SHAPE)
         {
-            use alloc::{rc::Rc, string::String, sync::Arc};
+            use alloc::{borrow::Cow, rc::Rc, string::String, sync::Arc};
             use facet_core::KnownPointer;
 
             let Some(known) = smart_ptr_def.known else {
+                pending_inner.drop_and_dealloc();
                 return Err(ReflectErrorKind::OperationFailed {
                     shape: smart_ptr_shape,
                     operation: "SmartPointer<str> missing known pointer type",
                 });
             };
 
-            // Read the String value from inner_ptr
-            let string_ptr = inner_ptr.as_mut_byte_ptr() as *mut String;
+            if !matches!(
+                known,
+                KnownPointer::Box | KnownPointer::Arc | KnownPointer::Rc | KnownPointer::Cow
+            ) {
+                pending_inner.drop_and_dealloc();
+                return Err(ReflectErrorKind::OperationFailed {
+                    shape: smart_ptr_shape,
+                    operation: "Unsupported SmartPointer<str> type",
+                });
+            }
+
+            // Read the String value from its actual staging allocation.
+            let string_ptr = inner_data.as_mut_byte_ptr() as *mut String;
             let string_value = unsafe { core::ptr::read(string_ptr) };
 
             // Convert to the appropriate smart pointer type
@@ -1499,26 +1651,28 @@ impl Frame {
                         core::ptr::write(smart_ptr_data.as_mut_byte_ptr() as *mut Rc<str>, rc);
                     }
                 }
-                _ => {
-                    return Err(ReflectErrorKind::OperationFailed {
-                        shape: smart_ptr_shape,
-                        operation: "Unsupported SmartPointer<str> type",
-                    });
+                KnownPointer::Cow => {
+                    let cow: Cow<'static, str> = Cow::Owned(string_value);
+                    unsafe {
+                        core::ptr::write(
+                            smart_ptr_data.as_mut_byte_ptr() as *mut Cow<'static, str>,
+                            cow,
+                        );
+                    }
                 }
+                _ => unreachable!("supported SmartPointer<str> kind was checked above"),
             }
 
-            // Deallocate the String's memory (we moved the data out via ptr::read)
-            let string_layout = alloc::string::String::SHAPE.layout.sized_layout().unwrap();
-            if string_layout.size() > 0 {
-                unsafe { alloc::alloc::dealloc(inner_ptr.as_mut_byte_ptr(), string_layout) };
-            }
-
+            // `ptr::read` moved the String, so only its exact staging allocation
+            // remains to be reclaimed.
+            pending_inner.dealloc_after_move();
             return Ok(());
         }
 
+        pending_inner.drop_and_dealloc();
         Err(ReflectErrorKind::OperationFailed {
             shape: smart_ptr_shape,
-            operation: "SmartPointer missing new_into_fn and not a supported unsized type",
+            operation: "SmartPointer missing an owned construction capability and not a supported unsized type",
         })
     }
 
@@ -1615,19 +1769,21 @@ impl Frame {
                     Err(ReflectErrorKind::UninitializedValue {
                         shape: self.allocated.shape(),
                     })
-                } else if let Some(inner_ptr) = pending_inner.take() {
+                } else if let Some(pending_inner) = pending_inner.take() {
                     // Finalize the pending inner value
                     let smart_ptr_shape = self.allocated.shape();
                     if let Def::Pointer(smart_ptr_def) = smart_ptr_shape.def {
-                        Self::complete_pending_smart_pointer(
+                        let result = Self::complete_pending_smart_pointer(
                             smart_ptr_shape,
                             smart_ptr_def,
                             self.data,
-                            inner_ptr,
-                        )?;
-                        self.is_init = true;
-                        Ok(())
+                            pending_inner,
+                        );
+                        self.is_init = result.is_ok();
+                        result
                     } else {
+                        pending_inner.drop_and_dealloc();
+                        self.is_init = false;
                         Err(ReflectErrorKind::OperationFailed {
                             shape: smart_ptr_shape,
                             operation: "SmartPointer frame without SmartPointer definition",
@@ -2193,7 +2349,7 @@ impl<'facet, const BORROW: bool> Drop for Partial<'facet, BORROW> {
                         }
                         _ => {}
                     }
-                    frame.deinit();
+                    frame.deinit_for_cancellation();
                     frame.dealloc();
                 }
             }
@@ -2229,7 +2385,7 @@ impl<'facet, const BORROW: bool> Drop for Partial<'facet, BORROW> {
                 }
             }
 
-            frame.deinit();
+            frame.deinit_for_cancellation();
             frame.dealloc();
         }
     }
@@ -2265,5 +2421,93 @@ mod size_tests {
             size_of::<DynamicValueState>()
         );
         eprintln!("===================\n");
+    }
+}
+
+#[cfg(test)]
+mod pending_smart_pointer_tests {
+    use alloc::{borrow::Cow, string::String};
+    use core::{
+        mem::MaybeUninit,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use facet::Facet;
+
+    static EXTERNAL_PENDING_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Facet)]
+    struct ExternalPendingDropTracker;
+
+    impl Drop for ExternalPendingDropTracker {
+        fn drop(&mut self) {
+            EXTERNAL_PENDING_DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cow_pending_smart_pointer_drop_uses_actual_staging_shape() {
+        let mut partial = Partial::alloc::<Cow<'static, str>>().unwrap();
+        let string_layout = String::SHAPE.layout.sized_layout().unwrap();
+        let staging_data = facet_core::alloc_for_layout(string_layout);
+        unsafe {
+            staging_data.put(String::from(
+                "the pending String staging allocation must be dropped as String, not str",
+            ));
+        }
+
+        let root = partial.frames_mut().last_mut().unwrap();
+        root.tracker = Tracker::SmartPointer {
+            building_inner: false,
+            pending_inner: Some(PendingSmartPointerInner {
+                data: staging_data,
+                allocated: AllocatedShape::new(String::SHAPE, string_layout.size()),
+                ownership: FrameOwnership::Owned,
+            }),
+        };
+        // This models the old deferred state marker and verifies that pending
+        // staging prevents `Frame::deinit` from dropping uninitialized Cow storage.
+        root.is_init = true;
+
+        drop(partial);
+    }
+
+    #[test]
+    fn external_reinitialization_drains_direct_pending_smart_pointer_staging() {
+        EXTERNAL_PENDING_DROPS.store(0, Ordering::SeqCst);
+
+        let mut destination = MaybeUninit::<Cow<'static, ExternalPendingDropTracker>>::uninit();
+        let destination = PtrUninit::new(destination.as_mut_ptr().cast::<u8>());
+        let mut partial: Partial<'_, false> = unsafe {
+            Partial::from_raw_with_shape(destination, Cow::<ExternalPendingDropTracker>::SHAPE)
+                .unwrap()
+        };
+
+        let staging_layout = ExternalPendingDropTracker::SHAPE
+            .layout
+            .sized_layout()
+            .unwrap();
+        let staging_data = facet_core::alloc_for_layout(staging_layout);
+        unsafe { staging_data.put(ExternalPendingDropTracker) };
+
+        let root = partial.frames_mut().last_mut().unwrap();
+        root.tracker = Tracker::SmartPointer {
+            building_inner: false,
+            pending_inner: Some(PendingSmartPointerInner {
+                data: staging_data,
+                allocated: AllocatedShape::new(
+                    ExternalPendingDropTracker::SHAPE,
+                    staging_layout.size(),
+                ),
+                ownership: FrameOwnership::Owned,
+            }),
+        };
+
+        partial.prepare_for_reinitialization();
+        assert_eq!(EXTERNAL_PENDING_DROPS.load(Ordering::SeqCst), 1);
+
+        drop(partial);
+        assert_eq!(EXTERNAL_PENDING_DROPS.load(Ordering::SeqCst), 1);
     }
 }

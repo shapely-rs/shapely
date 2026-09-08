@@ -70,7 +70,8 @@ unsafe fn yoke_drop<Y: for<'y> Yokeable<'y>, C>(ox: OxPtrMut) {
 /// and constructs Y by borrowing from it.
 ///
 /// # Strategy
-/// 1. First tries Y's `new_into_fn` (for pointer types like Cow)
+/// 1. First tries Y's `borrow_from_pointee_fn` when its pointee matches the cart
+///    target (for pointer types like Cow)
 /// 2. Then tries Y's `try_from` (for user types with #[facet(from_ref)])
 /// 3. Returns Unsupported if neither is available
 #[allow(non_snake_case)]
@@ -96,20 +97,21 @@ where
     unsafe {
         // Read the cart from source (consumes ownership)
         // Use try_attach_to_cart so we can return errors properly
-        // First try: Y has new_into_fn (pointer type like Cow)
+        // First try: Y can construct a borrow from the stable cart pointee.
         let result = {
             if let Ok(ptr_def) = OUTPUT_SHAPE.def.into_pointer()
-                && let Some(new_into_fn) = ptr_def.vtable.new_into_fn
+                && let Some(pointee_shape) = ptr_def.pointee
+                && pointee_shape.is_shape(<C as Deref>::Target::SHAPE)
+                && let Some(borrow_from_pointee_fn) = ptr_def.vtable.borrow_from_pointee_fn
             {
-                Yoke::<Y, C>::try_attach_to_cart(src_ptr.read::<C>(), |mut cart_ref| {
+                Yoke::<Y, C>::try_attach_to_cart(src_ptr.read::<C>(), |cart_ref| {
                     let mut maybe_uninit = MaybeUninit::<Y::Output>::uninit();
-                    let cart_ref_ptr = PtrMut::new(&mut cart_ref as *mut _);
-                    let out_ptr = new_into_fn(
+                    borrow_from_pointee_fn(
                         PtrUninit::from_maybe_uninit(&mut maybe_uninit),
-                        cart_ref_ptr,
+                        PtrConst::new(cart_ref as *const _),
                     );
                     // Read as Y::Output (same layout as Y, different lifetime)
-                    let out = out_ptr.read::<Y::Output>();
+                    let out = maybe_uninit.assume_init();
                     Ok(out)
                 })
             } else {
@@ -168,7 +170,7 @@ where
                             }
                         })
                     }
-                    // We checked has_new_into || has_try_from above, so this should be unreachable
+                    // The borrow hook was unavailable, and no supported try_from path remained.
                     _ => Err(TryFromOutcome::Unsupported),
                 }
             }
@@ -262,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_yoke_vtable_new_try_borrow_inner_drop() {
+    fn test_yoke_vtable_borrow_from_pointee_try_from_inner_drop() {
         facet_testhelpers::setup();
 
         let yoke_shape = <Yoke<Cow<'static, str>, Arc<str>>>::SHAPE;
@@ -313,5 +315,34 @@ mod tests {
         // Deallocate the memory
         // SAFETY: arc_ptr was allocated by arc_shape and is now dropped (but memory is still valid)
         unsafe { yoke_shape.deallocate_mut(yoke_ptr).unwrap() };
+    }
+
+    #[test]
+    fn test_yoke_rejects_borrowing_pointer_when_cart_pointee_does_not_match() {
+        facet_testhelpers::setup();
+
+        // `Cow<str>` has a borrowed-construction hook, but this cart contains a
+        // `u8`. Calling that hook would reinterpret the cart target as `str`.
+        let yoke_shape = <Yoke<Cow<'static, str>, Arc<u8>>>::SHAPE;
+        let yoke_uninit_ptr = yoke_shape.allocate().unwrap();
+        let mut value = ManuallyDrop::new(Arc::new(42_u8));
+
+        let result = unsafe {
+            yoke_shape.call_try_from(
+                <Arc<u8>>::SHAPE,
+                PtrConst::new_sized(&value as *const _),
+                yoke_uninit_ptr,
+            )
+        }
+        .expect("Yoke should expose try_from");
+
+        assert_eq!(result, TryFromOutcome::Unsupported);
+
+        // The unsupported path retains source ownership and leaves the target
+        // uninitialized, so clean both up explicitly.
+        unsafe {
+            ManuallyDrop::drop(&mut value);
+            yoke_shape.deallocate_uninit(yoke_uninit_ptr).unwrap();
+        }
     }
 }

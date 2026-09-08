@@ -43,9 +43,16 @@ impl PointerDef {
         self.strong
     }
 
-    /// Whether a new pointer can be constructed from an owned value of its pointee type.
+    /// Whether a new pointer can be constructed as an independent owner of its pointee.
+    ///
+    /// Most pointer types transfer the pointee with [`NewIntoFn`]. Pointer types
+    /// such as [`Cow`](alloc::borrow::Cow) can instead borrow the pointee and
+    /// immediately materialize an owned representation through the paired
+    /// `borrow_from_pointee_fn` and `promote_to_owned_fn` operations.
     pub const fn constructible_from_pointee(&self) -> bool {
         self.vtable.new_into_fn.is_some()
+            || (self.vtable.borrow_from_pointee_fn.is_some()
+                && self.vtable.promote_to_owned_fn.is_some())
             || matches!(
                 self.known,
                 Some(KnownPointer::Box | KnownPointer::Rc | KnownPointer::Arc)
@@ -128,6 +135,46 @@ pub type BorrowFn = unsafe extern "C" fn(this: PtrConst) -> PtrConst;
 /// `ptr` is moved out of (with [`core::ptr::read`]) — it should be deallocated afterwards (e.g.
 /// with [`core::mem::forget`]) but NOT dropped).
 pub type NewIntoFn = unsafe extern "C" fn(this: PtrUninit, ptr: PtrMut) -> PtrMut;
+
+/// Constructs a borrowed pointer from a stable initialized pointee.
+///
+/// This initializes `dst` as a pointer value. The pointee is not consumed.
+///
+/// # Safety
+///
+/// - `dst` must be allocated, have the right layout for the pointer type, and
+///   be uninitialized.
+/// - `pointee` must point to a valid value of the pointer's reflected pointee
+///   type.
+/// - The caller must keep `pointee` valid and stable for every use through the
+///   constructed pointer and any derived references, copies, or clones. Any
+///   lifetime represented by those values must be bounded by the source's
+///   validity, including when the caller manages that bound dynamically.
+/// - Dropping or promoting the constructed pointer only ends that instance's
+///   borrow; it does not end borrows retained by other values.
+/// - The implementation must initialize `dst`; the initialized value may
+///   access `pointee` until it is dropped or promoted.
+pub type BorrowFromPointeeFn = unsafe extern "C" fn(dst: PtrUninit, pointee: PtrConst);
+
+/// Promotes a borrowed pointer to its owned representation in place.
+///
+/// On return, `this` remains initialized and does not access a pointee that it
+/// borrowed before the call. For a pointer already in its owned representation,
+/// promotion may be a no-op.
+///
+/// This operation affects only `this`. References or borrowed pointer clones
+/// obtained before promotion may still depend on the original pointee.
+///
+/// # Safety
+///
+/// - `this` must point to an initialized value of the reflected pointer type.
+/// - The caller must have exclusive access to `this`.
+/// - If `this` currently borrows a pointee, that pointee must remain valid and
+///   stable until this function returns.
+/// - The caller may drop or deallocate a formerly borrowed pointee only when
+///   no other value can still access it. In particular, any borrowed copies,
+///   clones, or derived references must also have ended their dependency.
+pub type PromoteToOwnedFn = unsafe extern "C" fn(this: PtrMut);
 
 /// Type-erased result of locking a mutex-like or reader-writer lock pointer.
 ///
@@ -290,6 +337,12 @@ pub struct PointerVTable {
     /// See [`NewIntoFn`]
     pub new_into_fn: Option<NewIntoFn>,
 
+    /// See [`BorrowFromPointeeFn`]
+    pub borrow_from_pointee_fn: Option<BorrowFromPointeeFn>,
+
+    /// See [`PromoteToOwnedFn`]
+    pub promote_to_owned_fn: Option<PromoteToOwnedFn>,
+
     /// See [`LockFn`]
     pub lock_fn: Option<LockFn>,
 
@@ -318,6 +371,8 @@ impl PointerVTable {
             downgrade_into_fn: None,
             borrow_fn: None,
             new_into_fn: None,
+            borrow_from_pointee_fn: None,
+            promote_to_owned_fn: None,
             lock_fn: None,
             read_fn: None,
             write_fn: None,

@@ -35,8 +35,46 @@ impl<const BORROW: bool> Partial<'_, BORROW> {
             }
         };
 
-        // Handle re-initialization if the smart pointer is already initialized
+        // Capture the pending pointee path before reinitialization changes the
+        // parent tracker. Deferred mode stores a completed pointee at this path
+        // so a later visit can resume that exact allocation.
+        let deferred_inner_path = (self.is_deferred()
+            && matches!(
+                self.frames().last().unwrap().tracker,
+                Tracker::SmartPointer {
+                    building_inner: true,
+                    ..
+                }
+            ))
+        .then(|| self.derive_path());
+
+        // Handle re-initialization if the smart pointer is already initialized.
+        // This also drains any direct pending staging value before its tracker is
+        // replaced below.
         self.prepare_for_reinitialization();
+
+        // Restore a deferred pointee instead of allocating a second one for the
+        // same path. Besides preserving partial nested construction, this keeps
+        // the stored frame's drop/deallocation authority intact until it is
+        // explicitly reinitialized or finalized.
+        if let Some(check_path) = deferred_inner_path
+            && let FrameMode::Deferred {
+                stack,
+                stored_frames,
+                ..
+            } = &mut self.mode
+            && let Some(mut stored_frame) = stored_frames.remove(&check_path)
+        {
+            crate::trace!("begin_smart_ptr: restoring stored pointee for path {check_path:?}");
+            let frame = stack.last_mut().unwrap();
+            frame.tracker = Tracker::SmartPointer {
+                building_inner: true,
+                pending_inner: None,
+            };
+            stored_frame.tracker.clear_current_child();
+            stack.push(stored_frame);
+            return Ok(self);
+        }
 
         // Get shape and type_plan upfront to avoid borrow conflicts
         let shape = self.frames().last().unwrap().allocated.shape();

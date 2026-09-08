@@ -1,9 +1,9 @@
 use crate::{
     Def, Facet, KnownPointer, OxPtrConst, OxPtrMut, OxPtrUninit, PointerDef, PointerFlags,
-    PointerVTable, PtrConst, Shape, ShapeBuilder, Type, TypeNameFn, TypeNameOpts, TypeOpsIndirect,
-    TypeParam, UserType, VTableIndirect, Variance, VarianceDep, VarianceDesc,
+    PointerVTable, PtrConst, PtrMut, PtrUninit, Shape, ShapeBuilder, Type, TypeNameFn,
+    TypeNameOpts, TypeOpsIndirect, TypeParam, UserType, VTableIndirect, Variance, VarianceDep,
+    VarianceDesc,
 };
-use crate::{PtrMut, PtrUninit};
 use alloc::borrow::Cow;
 use alloc::borrow::ToOwned;
 
@@ -141,15 +141,29 @@ where
     PtrConst::new(inner_ref as *const T)
 }
 
-/// Create a new `Cow<T>` from a borrowed value
-unsafe extern "C" fn cow_new_into<T: ?Sized + ToOwned + 'static>(
-    this: PtrUninit,
-    ptr: PtrMut,
-) -> PtrMut
+/// Construct `Cow::Borrowed` from a stable pointee.
+///
+/// # Safety
+///
+/// The caller must keep `pointee` valid for the resulting Cow and every derived
+/// borrow or clone. Promoting one Cow only ends that instance's dependency.
+unsafe extern "C" fn cow_borrow_from_pointee<T: ?Sized + ToOwned + 'static>(
+    dst: PtrUninit,
+    pointee: PtrConst,
+) where
+    T::Owned: 'static,
+{
+    let pointee = unsafe { pointee.get::<T>() };
+    unsafe { dst.put(Cow::<'static, T>::Borrowed(pointee)) };
+}
+
+/// Materialize an owned Cow in place.
+unsafe extern "C" fn cow_promote_to_owned<T: ?Sized + ToOwned + 'static>(this: PtrMut)
 where
     T::Owned: 'static,
 {
-    unsafe { this.put(Cow::<'_, T>::Borrowed(ptr.read())) }
+    let cow = unsafe { this.as_mut::<Cow<'static, T>>() };
+    let _ = cow.to_mut();
 }
 
 unsafe impl<'a, T> Facet<'a> for Cow<'a, T>
@@ -295,7 +309,8 @@ where
                 vtable: &const {
                     PointerVTable {
                         borrow_fn: Some(cow_borrow::<T>),
-                        new_into_fn: Some(cow_new_into::<T>),
+                        borrow_from_pointee_fn: Some(cow_borrow_from_pointee::<T>),
+                        promote_to_owned_fn: Some(cow_promote_to_owned::<T>),
                         ..PointerVTable::new()
                     }
                 },
@@ -346,8 +361,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use core::{mem::ManuallyDrop, ptr::NonNull};
-
     use alloc::string::String;
 
     use super::*;
@@ -362,55 +375,89 @@ mod tests {
     }
 
     #[test]
-    fn test_cow_vtable_1_new_borrow_drop() {
+    fn test_cow_vtable_borrow_and_promote_str() {
         facet_testhelpers::setup();
 
-        let cow_shape = <Cow<'_, str>>::SHAPE;
+        let cow_shape = <Cow<'static, str>>::SHAPE;
         let cow_def = cow_shape
             .def
             .into_pointer()
-            .expect("Cow<'_, T> should have a smart pointer definition");
+            .expect("Cow<'static, str> should have a smart pointer definition");
 
-        // Allocate memory for the Cow
-        let cow_uninit_ptr = cow_shape.allocate().unwrap();
+        assert!(
+            cow_def.vtable.new_into_fn.is_none(),
+            "Cow's borrowed construction must not masquerade as an owned-pointee move"
+        );
 
-        // Get the function pointer for creating a new Cow from a value
-        let new_into_fn = cow_def
+        let borrow_from_pointee = cow_def
             .vtable
-            .new_into_fn
-            .expect("Cow<'_, T> should have new_into_fn");
-
-        // Create the value and initialize the Cow
-        let mut value = ManuallyDrop::new("example");
-        let cow_ptr = unsafe {
-            new_into_fn(
-                cow_uninit_ptr,
-                PtrMut::new(NonNull::from(&mut value).as_ptr()),
-            )
-        };
-        // The value now belongs to the Cow, prevent its drop
-
-        // Get the function pointer for borrowing the inner value
+            .borrow_from_pointee_fn
+            .expect("Cow<'static, str> should expose borrowed construction");
+        let promote_to_owned = cow_def
+            .vtable
+            .promote_to_owned_fn
+            .expect("Cow<'static, str> should expose in-place ownership promotion");
         let borrow_fn = cow_def
             .vtable
             .borrow_fn
-            .expect("Cow<'_, T> should have borrow_fn");
+            .expect("Cow<'static, str> should expose inner borrowing");
 
-        // Borrow the inner value and check it
+        let source = String::from("example");
+        let cow_uninit = cow_shape.allocate().unwrap();
+        unsafe {
+            borrow_from_pointee(cow_uninit, PtrConst::new(source.as_str() as *const str));
+        }
+        let cow_ptr = unsafe { cow_uninit.assume_init() };
+
+        let borrowed = unsafe { cow_ptr.get::<Cow<'static, str>>() };
+        assert!(matches!(borrowed, Cow::Borrowed(value) if *value == "example"));
+
+        unsafe { promote_to_owned(cow_ptr) };
+        let promoted = unsafe { cow_ptr.get::<Cow<'static, str>>() };
+        assert!(matches!(promoted, Cow::Owned(value) if value == "example"));
+
+        drop(source);
         let borrowed_ptr = unsafe { borrow_fn(cow_ptr.as_const()) };
-        // SAFETY: borrowed_ptr points to a valid String within the Cow
         assert_eq!(unsafe { borrowed_ptr.get::<str>() }, "example");
 
-        // Drop the value in place
-        // SAFETY: value_ptr points to a valid String
         unsafe {
             cow_shape
                 .call_drop_in_place(cow_ptr)
-                .expect("Cow<'_, T> should have drop_in_place");
+                .expect("promoted Cow should be droppable");
+            cow_shape.deallocate_mut(cow_ptr).unwrap();
         }
+    }
 
-        // Deallocate the memory
-        // SAFETY: cow_ptr was allocated by cow_shape and is now dropped (but memory is still valid)
-        unsafe { cow_shape.deallocate_mut(cow_ptr).unwrap() };
+    #[test]
+    fn test_cow_vtable_promotion_preserves_other_clones_borrows() {
+        let cow_def = <Cow<'static, str>>::SHAPE.def.into_pointer().unwrap();
+        let borrow_from_pointee = cow_def.vtable.borrow_from_pointee_fn.unwrap();
+        let promote_to_owned = cow_def.vtable.promote_to_owned_fn.unwrap();
+        let source = String::from("shared borrowed source");
+        let mut destination = core::mem::MaybeUninit::<Cow<'static, str>>::uninit();
+
+        // The source remains live until both independently borrowed Cows have
+        // been promoted, and no derived references escape this scope.
+        unsafe {
+            borrow_from_pointee(
+                PtrUninit::from_maybe_uninit(&mut destination),
+                PtrConst::new(source.as_str() as *const str),
+            );
+        }
+        let mut original = unsafe { destination.assume_init() };
+        let mut cloned = original.clone();
+
+        unsafe { promote_to_owned(PtrMut::new(&mut original)) };
+        assert!(matches!(&original, Cow::Owned(_)));
+        assert!(matches!(
+            &cloned,
+            Cow::Borrowed(value) if core::ptr::eq(*value, source.as_str()),
+        ));
+        assert_eq!(cloned, "shared borrowed source");
+
+        unsafe { promote_to_owned(PtrMut::new(&mut cloned)) };
+        drop(source);
+        assert!(matches!(&cloned, Cow::Owned(_)));
+        assert_eq!(original, cloned);
     }
 }

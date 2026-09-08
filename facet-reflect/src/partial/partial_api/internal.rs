@@ -473,15 +473,18 @@ impl<'facet, const BORROW: bool> Partial<'facet, BORROW> {
         // - Enum frames: only drops fields marked in data
         // - Map/Set frames: also cleans up partial insert state (key/value buffers)
         //
-        // For TrackedBuffer/BorrowedInPlace frames, skip deinit() entirely because
-        // begin_inner() pushes a new frame rather than replacing the current value,
-        // so we don't need to clean up - the parent will handle its entry.
+        // For TrackedBuffer/BorrowedInPlace/External frames, skip normal deinit()
+        // because the frame does not own its destination storage. A deferred
+        // SmartPointer's pending staging allocation is separate ownership, though,
+        // and must be released before begin_smart_ptr overwrites its tracker.
         let frame = self.frames_mut().last_mut().unwrap();
         if matches!(
             frame.ownership,
             FrameOwnership::Owned | FrameOwnership::Field { .. }
         ) {
             frame.deinit();
+        } else {
+            frame.drop_pending_smart_pointer_staging();
         }
 
         true
